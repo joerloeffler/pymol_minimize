@@ -27,10 +27,19 @@ _STANDARD_PROTEIN = {
     "PRO", "SER", "THR", "TRP", "TYR", "VAL", "AIB", "NLN",
 }
 
+_AIB_HEAVY_BONDS = {
+    frozenset(("N", "CA")), frozenset(("CA", "C")),
+    frozenset(("C", "O")), frozenset(("CA", "CB1")),
+    frozenset(("CA", "CB2")),
+}
+
 
 def requires_compiled_backend(cmd, system: str, state: int = 1) -> bool:
     model = cmd.get_model(system, int(state))
-    return any(atom.resn.upper() in _PDB_SUGARS for atom in model.atom)
+    return any(
+        atom.resn.upper() in _PDB_SUGARS or atom.resn.upper() == "AIB"
+        for atom in model.atom
+    )
 
 
 def _atom_key(atom):
@@ -69,6 +78,26 @@ def _surplus_anomeric_oxygens(model):
         if has_external_link and same_residue_o1 is not None:
             remove.add(same_residue_o1)
     return remove
+
+
+def _invalid_aib_bonds(model):
+    """Find impossible bonds PyMOL inferred from collapsed AIB coordinates."""
+    invalid = []
+    for bond in model.bond:
+        left, right = (model.atom[i] for i in bond.index)
+        if left.resn.upper() != "AIB" or right.resn.upper() != "AIB":
+            continue
+        same_residue = (
+            left.model == right.model and left.segi == right.segi
+            and left.chain == right.chain and left.resi == right.resi
+        )
+        if not same_residue:
+            continue
+        if (left.symbol or left.elem).upper() == "H" or (right.symbol or right.elem).upper() == "H":
+            continue
+        if frozenset((left.name, right.name)) not in _AIB_HEAVY_BONDS:
+            invalid.append((left, right))
+    return invalid
 
 
 def _run(command, cwd: Path, stdin_path: Path | None = None) -> str:
@@ -213,6 +242,141 @@ def _coordinate_mapping(model, topology, positions):
     return mapping
 
 
+def _add_aib_geometry_guards(omm_system, topology):
+    """Keep peptide bonds adjoining AIB planar during severe clash repair.
+
+    Boltz-style inputs can place AIB methyl groups almost on top of each other.
+    The force field then has a very large local gradient, and a positional
+    backbone tether alone can let that strain escape by twisting peptide omega.
+    This periodic guard has minima at both cis and trans, so it preserves peptide
+    planarity without making a cis/trans assignment for the user.
+    """
+    from openmm import CustomAngleForce, CustomTorsionForce, unit
+
+    atoms = list(topology.atoms())
+    bonds = {atom.index: set() for atom in atoms}
+    for bond in topology.bonds():
+        bonds[bond[0].index].add(bond[1].index)
+        bonds[bond[1].index].add(bond[0].index)
+
+    residue_atoms = {
+        residue: {atom.name: atom for atom in residue.atoms()}
+        for chain in topology.chains() for residue in chain.residues()
+    }
+    guard = CustomTorsionForce("peptide_k*(1-cos(2*theta))")
+    guard.addGlobalParameter(
+        "peptide_k", 150.0 * unit.kilojoule_per_mole
+    )
+    added = set()
+    aib_angle = CustomAngleForce("0.5*aib_angle_k*(theta-theta0)^2")
+    aib_angle.addGlobalParameter(
+        "aib_angle_k", 400.0 * unit.kilojoule_per_mole / unit.radian**2
+    )
+    aib_angle.addPerAngleParameter("theta0")
+    angle_count = 0
+    for residue, named in residue_atoms.items():
+        if residue.name.upper() != "AIB" or not {"N", "CA", "C"} <= named.keys():
+            continue
+        if {"CB1", "CB2"} <= named.keys():
+            aib_angle.addAngle(
+                named["CB1"].index, named["CA"].index, named["CB2"].index,
+                [109.5 * unit.degree],
+            )
+            angle_count += 1
+        # Previous CA-C-N-CA peptide bond.
+        for neighbor_index in bonds[named["N"].index]:
+            neighbor = atoms[neighbor_index]
+            previous = residue_atoms.get(neighbor.residue, {})
+            if neighbor.name == "C" and "CA" in previous:
+                indices = (
+                    previous["CA"].index, neighbor.index,
+                    named["N"].index, named["CA"].index,
+                )
+                if indices not in added:
+                    guard.addTorsion(*indices)
+                    added.add(indices)
+        # Following CA-C-N-CA peptide bond.
+        for neighbor_index in bonds[named["C"].index]:
+            neighbor = atoms[neighbor_index]
+            following = residue_atoms.get(neighbor.residue, {})
+            if neighbor.name == "N" and "CA" in following:
+                indices = (
+                    named["CA"].index, named["C"].index,
+                    neighbor.index, following["CA"].index,
+                )
+                if indices not in added:
+                    guard.addTorsion(*indices)
+                    added.add(indices)
+    if added:
+        omm_system.addForce(guard)
+    if angle_count:
+        omm_system.addForce(aib_angle)
+    return len(added), angle_count
+
+
+def _validate_aib_geometry(topology, coordinates):
+    """Reject AIB output whose local covalent geometry remains implausible."""
+    atoms = list(topology.atoms())
+    xyz = np.asarray(coordinates, dtype=float)
+    bonds = {atom.index: set() for atom in atoms}
+    for bond in topology.bonds():
+        bonds[bond[0].index].add(bond[1].index)
+        bonds[bond[1].index].add(bond[0].index)
+    residue_atoms = {
+        residue: {atom.name: atom for atom in residue.atoms()}
+        for chain in topology.chains() for residue in chain.residues()
+    }
+
+    def angle(i, j, k):
+        left, right = xyz[i] - xyz[j], xyz[k] - xyz[j]
+        cosine = np.dot(left, right) / (np.linalg.norm(left) * np.linalg.norm(right))
+        return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+
+    def dihedral(i, j, k, l):
+        b0 = -(xyz[j] - xyz[i])
+        b1 = xyz[k] - xyz[j]
+        b2 = xyz[l] - xyz[k]
+        b1 /= np.linalg.norm(b1)
+        v = b0 - np.dot(b0, b1) * b1
+        w = b2 - np.dot(b2, b1) * b1
+        return float(np.degrees(np.arctan2(np.dot(np.cross(b1, v), w), np.dot(v, w))))
+
+    issues = []
+    for residue, named in residue_atoms.items():
+        if residue.name.upper() != "AIB" or not {"N", "CA", "C"} <= named.keys():
+            continue
+        label = f"AIB {residue.chain.id or '-'}:{residue.id}"
+        if {"CB1", "CB2"} <= named.keys():
+            value = angle(named["CB1"].index, named["CA"].index, named["CB2"].index)
+            if not 100.0 <= value <= 120.0:
+                issues.append(f"{label} CB1-CA-CB2 angle is {value:.1f} degrees")
+        peptide_torsions = []
+        for neighbor_index in bonds[named["N"].index]:
+            neighbor = atoms[neighbor_index]
+            previous = residue_atoms.get(neighbor.residue, {})
+            if neighbor.name == "C" and "CA" in previous:
+                peptide_torsions.append(dihedral(
+                    previous["CA"].index, neighbor.index,
+                    named["N"].index, named["CA"].index,
+                ))
+        for neighbor_index in bonds[named["C"].index]:
+            neighbor = atoms[neighbor_index]
+            following = residue_atoms.get(neighbor.residue, {})
+            if neighbor.name == "N" and "CA" in following:
+                peptide_torsions.append(dihedral(
+                    named["CA"].index, named["C"].index,
+                    neighbor.index, following["CA"].index,
+                ))
+        for value in peptide_torsions:
+            distance_from_planar = min(abs(value), abs(180.0 - abs(value)))
+            if distance_from_planar > 20.0:
+                issues.append(f"{label} peptide omega is {value:.1f} degrees")
+    if issues:
+        raise MinimizationError(
+            "AIB geometry validation failed after relaxation: " + "; ".join(issues)
+        )
+
+
 def relax_compiled(
     selection="sele", system="all", state=1, mode="quick", quiet=0, _cmd=None,
     max_iterations=None, restraint=1000.0,
@@ -258,6 +422,7 @@ def relax_compiled(
         if mode == "thorough":
             system_kwargs["implicitSolvent"] = OBC2
         omm_system = prmtop.createSystem(**system_kwargs)
+        _add_aib_geometry_guards(omm_system, prmtop.topology)
         reference = inpcrd.positions.value_in_unit(unit.nanometer)
         outside = CustomExternalForce("outside_k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
         outside.addGlobalParameter(
@@ -320,9 +485,18 @@ def relax_compiled(
         final_state = simulation.context.getState(getPositions=True, getEnergy=True)
         final = final_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         final_positions = final_state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+        _validate_aib_geometry(prmtop.topology, final_positions)
         output_coordinates = [final_positions[i] for i in mapping]
 
         cmd.load_coords(output_coordinates, system, state=state)
+        # Collapsed AIB methyl groups can be close enough for PyMOL to infer
+        # impossible N-CB or CB-CB bonds. Amber minimized the correct template;
+        # remove those stale display/connectivity bonds only after validation.
+        for left, right in _invalid_aib_bonds(cmd.get_model(system, state)):
+            cmd.unbond(
+                f"{left.model} and index {left.index}",
+                f"{right.model} and index {right.index}",
+            )
         cmd.rebuild()
 
     result = MinimizationResult(

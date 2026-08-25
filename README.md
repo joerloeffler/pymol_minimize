@@ -119,7 +119,10 @@ The plugin chooses a backend from the structure:
 - Recognized covalent glycans use GLYCAM06j with ff14SB, compiled automatically
   by AmberTools and minimized by OpenMM.
 - AIB is supported using the Amber ff15ipq-m template plus the packaged bridge
-  parameter needed at an ff14SB peptide bond.
+  parameter needed at an ff14SB peptide bond. AIB relaxation adds targeted
+  geometry guards for its gem-dimethyl angle and both adjoining peptide-bond
+  planarity terms. A post-relaxation check rejects non-planar peptide bonds or a
+  still-collapsed `CB1-CA-CB2` angle instead of returning bad coordinates.
 
 For ambiguous PDB/mmCIF ligands, the plugin attempts bond-order and common net
 charge inference. SDF or MOL2 with explicit bond orders and formal charges is
