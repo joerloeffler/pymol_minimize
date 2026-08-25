@@ -1,0 +1,14 @@
+AIB carbonyl compatibility bridge for ff14SB
+MASS
+
+BOND
+
+ANGLE
+AB-C-O             80.0         120.40  AIB carbonyl, transferred from ff15ipq-m AB-C-OD
+
+DIHE
+
+IMPROPER
+
+NONBON
+

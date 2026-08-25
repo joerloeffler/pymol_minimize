@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pymol-quick-minimize"
+version = "0.1.0"
+description = "MOE-like restrained local energy minimization for PyMOL"
+readme = "README.md"
+requires-python = ">=3.10"
+# Runtime packages are intentionally installed from conda-forge with
+# environment.yml. In particular, openff-toolkit is not a portable PyPI
+# dependency, so declaring it here would make `pip install` misleading.
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["pymol_quick_minimize*"]
+
+[tool.setuptools.package-data]
+pymol_quick_minimize = ["data/*"]

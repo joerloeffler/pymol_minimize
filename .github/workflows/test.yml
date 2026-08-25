@@ -1,0 +1,25 @@
+name: scientific-smoke-tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: pymol-quick-minimize
+          environment-file: environment.yml
+          auto-activate-base: false
+      - name: Run smoke tests
+        shell: bash -el {0}
+        run: python -m unittest discover -s tests -v
+

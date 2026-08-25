@@ -1,0 +1,14 @@
+LICENSE
+README.md
+pyproject.toml
+pymol_quick_minimize/__init__.py
+pymol_quick_minimize/amber_backend.py
+pymol_quick_minimize/core.py
+pymol_quick_minimize/diagnostics.py
+pymol_quick_minimize/gui.py
+pymol_quick_minimize.egg-info/PKG-INFO
+pymol_quick_minimize.egg-info/SOURCES.txt
+pymol_quick_minimize.egg-info/dependency_links.txt
+pymol_quick_minimize.egg-info/top_level.txt
+pymol_quick_minimize/data/frcmod.aib_ff14sb_bridge
+tests/test_smoke.py
