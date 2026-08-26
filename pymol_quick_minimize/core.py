@@ -506,7 +506,11 @@ def quick_relax(selection="sele", system="all", quiet=0, _cmd=None, **kwargs):
     from pymol import cmd as pymol_cmd
     from .amber_backend import relax_compiled, requires_compiled_backend
 
-    active_cmd = _cmd or pymol_cmd
+    # PyMOL's cmd.extend may inject its command instance as ``_self``. It is
+    # control metadata, not a minimization option, so consume it at this public
+    # wrapper boundary before dispatching to either chemistry backend.
+    pymol_self = kwargs.pop("_self", None)
+    active_cmd = _cmd or pymol_self or pymol_cmd
     # MOE-like behavior: with no active PyMOL selection, relax the complete
     # system instead of failing on the conventional but absent ``sele`` name.
     if str(selection).strip() == "sele" and "sele" not in active_cmd.get_names("selections"):
@@ -522,7 +526,7 @@ def quick_relax(selection="sele", system="all", quiet=0, _cmd=None, **kwargs):
     kwargs.setdefault("restraint", 1000.0)
     kwargs.setdefault("implicit_solvent", 0)
     kwargs["relax_mode"] = "quick"
-    return minimize_selection(selection, system, quiet=quiet, _cmd=_cmd, **kwargs)
+    return minimize_selection(selection, system, quiet=quiet, _cmd=active_cmd, **kwargs)
 
 
 def thorough_relax(selection="sele", system="all", quiet=0, _cmd=None, **kwargs):
@@ -530,7 +534,8 @@ def thorough_relax(selection="sele", system="all", quiet=0, _cmd=None, **kwargs)
     from pymol import cmd as pymol_cmd
     from .amber_backend import relax_compiled, requires_compiled_backend
 
-    active_cmd = _cmd or pymol_cmd
+    pymol_self = kwargs.pop("_self", None)
+    active_cmd = _cmd or pymol_self or pymol_cmd
     if str(selection).strip() == "sele" and "sele" not in active_cmd.get_names("selections"):
         selection = system
     if requires_compiled_backend(active_cmd, system, int(kwargs.get("state", 1))):
@@ -544,4 +549,4 @@ def thorough_relax(selection="sele", system="all", quiet=0, _cmd=None, **kwargs)
     kwargs.setdefault("restraint", 1000.0)
     kwargs.setdefault("implicit_solvent", 1)
     kwargs["relax_mode"] = "thorough"
-    return minimize_selection(selection, system, quiet=quiet, _cmd=_cmd, **kwargs)
+    return minimize_selection(selection, system, quiet=quiet, _cmd=active_cmd, **kwargs)

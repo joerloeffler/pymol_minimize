@@ -165,6 +165,22 @@ python -m compileall -q pymol_quick_minimize
 python -m unittest discover -s tests -v
 ```
 
+## Headless AIB batch relaxation
+
+Do not rely on GUI plugin command registration in `pymol -c`; some PyMOL builds
+skip plugin autoloading in headless mode. The included runner imports the same
+backend explicitly and returns a nonzero exit status if any file fails:
+
+```bash
+conda activate pymol-quick-minimize
+python batch_relax_aib.py ./*.pdb --output-dir minimized
+```
+
+Each input is loaded into a fresh PyMOL session, only `resn AIB` is movable, and
+the complete structure remains in the force-field system. Outputs are named
+`<input>_AIB_relaxed.pdb`; files with no AIB or invalid connectivity are reported
+as failures rather than silently copied.
+
 Release-quality cross-platform distribution still requires clean macOS, Linux,
 and eventually Windows CI runs rather than assuming that one working machine is
 enough.

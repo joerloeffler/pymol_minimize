@@ -270,7 +270,7 @@ def _add_aib_geometry_guards(omm_system, topology):
     added = set()
     aib_angle = CustomAngleForce("0.5*aib_angle_k*(theta-theta0)^2")
     aib_angle.addGlobalParameter(
-        "aib_angle_k", 400.0 * unit.kilojoule_per_mole / unit.radian**2
+        "aib_angle_k", 2000.0 * unit.kilojoule_per_mole / unit.radian**2
     )
     aib_angle.addPerAngleParameter("theta0")
     angle_count = 0

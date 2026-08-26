@@ -57,6 +57,15 @@ class QuickMinimizeSmokeTests(unittest.TestCase):
             )
         self.assertEqual(result.movable_atom_count, result.atom_count)
 
+    def test_pymol_self_keyword_reaches_small_molecule_backend_safely(self):
+        cmd.fragment("benzene", "lig")
+        with tempfile.TemporaryDirectory() as temp:
+            result = quick_relax(
+                "all", "all", max_iterations=2, quiet=1,
+                cache=str(Path(temp) / "templates.json"), _self=cmd,
+            )
+        self.assertEqual(result.movable_atom_count, result.atom_count)
+
 
 if __name__ == "__main__":
     unittest.main()
