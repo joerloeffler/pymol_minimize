@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from io import StringIO
+from copy import copy
 import os
 from typing import Any
 
@@ -32,6 +33,12 @@ _BIOPOLYMER_RESIDUES = {
     "A", "C", "G", "U", "DA", "DC", "DG", "DT", "HOH", "WAT",
 }
 
+_SIMPLE_IONS = {
+    "Li": 1, "Na": 1, "K": 1, "Rb": 1, "Cs": 1,
+    "F": -1, "Cl": -1, "Br": -1, "I": -1,
+    "Mg": 2, "Ca": 2, "Sr": 2, "Ba": 2, "Zn": 2,
+}
+
 _PROTEIN_BACKBONE_NAMES = {"N", "CA", "C", "O", "OXT"}
 
 
@@ -49,15 +56,63 @@ def _formal_charge(atom: Any) -> int:
         return 0
 
 
+def _without_spurious_hydrogen_bonds(model):
+    """Ignore extra inter-residue bonds on already bonded explicit hydrogens."""
+    def residue(atom):
+        return atom.model, atom.segi, atom.chain, atom.resi, atom.resn
+
+    internally_bonded_h = set()
+    for bond in model.bond:
+        i, j = bond.index
+        if residue(model.atom[i]) == residue(model.atom[j]):
+            for index in (i, j):
+                if (model.atom[index].symbol or model.atom[index].elem).upper() == "H":
+                    internally_bonded_h.add(index)
+    cleaned = copy(model)
+    cleaned.bond = [
+        bond for bond in model.bond
+        if not (
+            residue(model.atom[bond.index[0]]) != residue(model.atom[bond.index[1]])
+            and internally_bonded_h.intersection(bond.index)
+        )
+    ]
+    return cleaned
+
+
 def _build_topology(model: Any):
     from openmm.app import Element, Topology
 
     topology = Topology()
     chains = {}
     residues = {}
-    omm_atoms = []
-
+    omm_atoms = [None] * len(model.atom)
+    # OpenMM requires atom indices to follow chain/residue traversal order.
+    # PyMOL can interleave waters with protein residues sharing the same resi.
+    groups = {}
     for position, atom in enumerate(model.atom):
+        key = (atom.model or "", atom.segi or "", atom.chain or "")
+        groups.setdefault(key, {}).setdefault((atom.resi, atom.resn), []).append(position)
+    ordered = []
+    for chain_residues in groups.values():
+        residue_groups = sorted(
+            chain_residues.items(),
+            key=lambda item: item[0][1].upper() not in (_BIOPOLYMER_RESIDUES - {"HOH", "WAT"}),
+        )
+        for _, indices in residue_groups:
+            ordered.extend(indices)
+
+    atom_names = {}
+    for chain_residues in groups.values():
+        for (_, resn), indices in chain_residues.items():
+            names = [model.atom[i].name for i in indices]
+            if len(set(names)) != len(names) and resn.upper() not in _BIOPOLYMER_RESIDUES:
+                # PDB ligands often use only element names. Assign unique names
+                # in the working topology; PyMOL names and atom order stay intact.
+                for number, i in enumerate(indices, 1):
+                    atom_names[i] = f"X{number}"
+
+    for position in ordered:
+        atom = model.atom[position]
         chain_key = (atom.model or "", atom.segi or "", atom.chain or "")
         chain = chains.get(chain_key)
         if chain is None:
@@ -78,7 +133,9 @@ def _build_topology(model: Any):
                 f"Atom {atom.name!r} in {atom.resn}{atom.resi} has unsupported element {symbol!r}."
             ) from exc
         # Numeric, globally unique ids survive OpenMM Modeller's topology copy.
-        omm_atoms.append(topology.addAtom(atom.name or symbol, element, residue, id=str(position + 1)))
+        omm_atoms[position] = topology.addAtom(
+            atom_names.get(position, atom.name or symbol), element, residue, id=str(position + 1)
+        )
 
     bond_types = {1: None, 2: "Double", 3: "Triple", 4: "Aromatic"}
     from openmm.app import Double, Triple, Aromatic
@@ -131,6 +188,18 @@ def _small_molecules_from_model(model: Any):
             # disconnected OpenFF molecule. OpenMM will report the missing template.
             continue
 
+        if len(component) == 1:
+            source = model.atom[component[0]]
+            symbol = (source.symbol or source.elem).strip().capitalize()
+            if symbol in _SIMPLE_IONS:
+                charge = _formal_charge(source)
+                if charge not in (0, _SIMPLE_IONS[symbol]):
+                    raise MinimizationError(
+                        f"Unsupported charge {charge} for isolated {symbol}; "
+                        f"the Amber ion template uses {_SIMPLE_IONS[symbol]:+d}."
+                    )
+                continue
+
         rw = Chem.RWMol()
         old_to_new = {}
         for old_index in component:
@@ -160,15 +229,53 @@ def _small_molecules_from_model(model: Any):
             x, y, z = model.atom[old_index].coord
             conformer.SetAtomPosition(new_index, Point3D(float(x), float(y), float(z)))
         mol.AddConformer(conformer)
+        # PyMOL's order 4 also marks non-ring resonance bonds. Resolve
+        # recognizable carboxylates and guanidinium locally, preserving all
+        # other supplied bond orders rather than searching the entire ligand.
+        Chem.GetSymmSSSR(mol)
+        for center in mol.GetAtoms():
+            if center.GetSymbol() != "C" or center.GetDegree() != 3:
+                continue
+            neighbors = list(center.GetNeighbors())
+            resonance = [
+                bond for bond in center.GetBonds()
+                if bond.GetBondType() == Chem.BondType.AROMATIC and not bond.IsInRing()
+            ]
+            if not resonance:
+                continue
+            oxygens = [atom for atom in neighbors if atom.GetSymbol() == "O"]
+            nitrogens = [atom for atom in neighbors if atom.GetSymbol() == "N"]
+            if len(oxygens) == 2 and len(resonance) == 2:
+                terminal = [atom for atom in oxygens if atom.GetDegree() == 1]
+                if not terminal:
+                    continue
+                double_atom = terminal[0]
+                for atom in oxygens:
+                    bond = mol.GetBondBetweenAtoms(center.GetIdx(), atom.GetIdx())
+                    bond.SetBondType(Chem.BondType.DOUBLE if atom.GetIdx() == double_atom.GetIdx() else Chem.BondType.SINGLE)
+                    atom.SetFormalCharge(-1 if atom.GetIdx() != double_atom.GetIdx() and atom.GetDegree() == 1 else 0)
+            elif len(nitrogens) == 3:
+                double_atom = resonance[0].GetOtherAtom(center)
+                for atom in nitrogens:
+                    bond = mol.GetBondBetweenAtoms(center.GetIdx(), atom.GetIdx())
+                    bond.SetBondType(Chem.BondType.DOUBLE if atom.GetIdx() == double_atom.GetIdx() else Chem.BondType.SINGLE)
+                    atom.SetFormalCharge(1 if atom.GetIdx() == double_atom.GetIdx() and atom.GetDegree() == 3 else 0)
+        for bond in mol.GetBonds():
+            bond.SetIsAromatic(bond.GetBondType() == Chem.BondType.AROMATIC)
+        for atom in mol.GetAtoms():
+            atom.SetIsAromatic(any(bond.GetIsAromatic() for bond in atom.GetBonds()))
         try:
             if any(
-                int(round(getattr(bond, "order", 1) or 1)) == 4
+                mol.GetBondBetweenAtoms(old_to_new[bond.index[0]], old_to_new[bond.index[1]]).GetBondType()
+                == Chem.BondType.AROMATIC
                 and (len(adjacency[bond.index[0]]) == 1 or len(adjacency[bond.index[1]]) == 1)
                 for bond in model.bond
                 if bond.index[0] in old_to_new and bond.index[1] in old_to_new
             ):
                 raise ValueError("terminal delocalized bond requires bond-order inference")
             Chem.SanitizeMol(mol)
+            if any(atom.GetNumRadicalElectrons() for atom in mol.GetAtoms()):
+                raise ValueError("PDB bond orders produced radicals; infer closed-shell valence")
         except Exception:
             # PyMOL uses bond order 4 both for aromatic bonds and for some
             # delocalized/resonance bonds (notably terminal carboxylates). Rebuild
@@ -206,13 +313,14 @@ def _small_molecules_from_model(model: Any):
                     # PDB/mmCIF exports frequently omit ligand formal charges.
                     # Try common small net charges, preferring anions before
                     # cations because deprotonated oxygens are common.
-                    charge_candidates.extend([-1, 1, -2, 2, -3, 3])
+                    charge_candidates.extend([-1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6])
                 last_error = None
                 for total_charge in charge_candidates:
                     candidate = Chem.Mol(fallback_mol)
                     try:
                         rdDetermineBonds.DetermineBondOrders(
-                            candidate, charge=total_charge, allowChargedFragments=True
+                            candidate, charge=total_charge, allowChargedFragments=True,
+                            maxIterations=1000
                         )
                         Chem.SanitizeMol(candidate)
                         fallback_mol = candidate
@@ -254,8 +362,20 @@ def _repair_missing_heavy_atoms(topology, positions):
     from openmm.app import PDBFile
     from pdbfixer import PDBFixer
 
+    # PDBFixer treats names such as UNK as standard residues with no known
+    # bonds. Its atom-insertion path can therefore discard explicit ligand
+    # connectivity. Record it by identities stable across topology copies.
+    ligand_bonds = []
+    for bond in topology.bonds():
+        left, right = bond
+        if (left.residue.name.upper() not in _BIOPOLYMER_RESIDUES
+                or right.residue.name.upper() not in _BIOPOLYMER_RESIDUES):
+            ligand_bonds.append(
+                (_topology_atom_key(left), _topology_atom_key(right), bond.type, bond.order)
+            )
     buffer = StringIO()
-    PDBFile.writeFile(topology, positions, buffer, keepIds=True)
+    # Temporary sequential residue IDs avoid protein/water numbering collisions.
+    PDBFile.writeFile(topology, positions, buffer, keepIds=False)
     buffer.seek(0)
     fixer = PDBFixer(pdbfile=buffer)
     fixer.findMissingResidues()
@@ -263,6 +383,20 @@ def _repair_missing_heavy_atoms(topology, positions):
     fixer.findMissingAtoms()
     if fixer.missingAtoms or fixer.missingTerminals:
         fixer.addMissingAtoms()
+    repaired_atoms = {_topology_atom_key(atom): atom for atom in fixer.topology.atoms()}
+    existing_bonds = {
+        frozenset((_topology_atom_key(left), _topology_atom_key(right)))
+        for left, right in fixer.topology.bonds()
+    }
+    for left_key, right_key, bond_type, order in ligand_bonds:
+        if left_key not in repaired_atoms or right_key not in repaired_atoms:
+            raise MinimizationError("Heavy-atom repair changed an original ligand atom identity.")
+        key = frozenset((left_key, right_key))
+        if key not in existing_bonds:
+            fixer.topology.addBond(
+                repaired_atoms[left_key], repaired_atoms[right_key], type=bond_type, order=order
+            )
+            existing_bonds.add(key)
     return fixer.topology, fixer.positions
 
 
@@ -330,6 +464,17 @@ def minimize_selection(
     if cmd.count_atoms(system) == 0:
         raise MinimizationError(f"System selection {system!r} contains no atoms.")
 
+    input_model = cmd.get_model(system, state)
+    cleaned_model = _without_spurious_hydrogen_bonds(input_model)
+    retained_bonds = {tuple(bond.index) for bond in cleaned_model.bond}
+    for bond in input_model.bond:
+        if tuple(bond.index) not in retained_bonds:
+            left, right = (input_model.atom[i] for i in bond.index)
+            cmd.unbond(
+                f"model {left.model} and index {left.index}",
+                f"model {right.model} and index {right.index}",
+            )
+
     if _as_bool(add_hydrogens):
         # PyMOL generally does a useful job on standalone organic molecules, and
         # those explicit H atoms are required to preserve the ligand's identity.
@@ -337,7 +482,7 @@ def minimize_selection(
         # the correct terminal/protonation naming and bonding patterns.
         cmd.h_add(f"({system}) and not polymer", state=state)
 
-    model = cmd.get_model(system, state)
+    model = _without_spurious_hydrogen_bonds(cmd.get_model(system, state))
     if not model.atom:
         raise MinimizationError("No atoms were available after structure preparation.")
 
@@ -348,8 +493,13 @@ def minimize_selection(
         raise MinimizationError("The movable selection does not overlap the system selection.")
 
     topology = _build_topology(model)
-    positions = [Vec3(*map(float, atom.coord)) for atom in model.atom] * unit.angstrom
-    original_atom_keys = [_topology_atom_key(atom) for atom in topology.atoms()]
+    positions = [
+        Vec3(*map(float, model.atom[int(atom.id) - 1].coord))
+        for atom in topology.atoms()
+    ] * unit.angstrom
+    original_atom_keys = [None] * len(model.atom)
+    for atom in topology.atoms():
+        original_atom_keys[int(atom.id) - 1] = _topology_atom_key(atom)
     if len(set(original_atom_keys)) != len(original_atom_keys):
         raise MinimizationError(
             "The system contains duplicate atom names within a residue. Rename atoms uniquely "

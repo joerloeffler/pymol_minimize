@@ -113,9 +113,12 @@ ordinary workstations.
 The plugin chooses a backend from the structure:
 
 - Standard proteins/nucleic acids use Amber ff14SB in OpenMM.
+- Isolated common ions, including Ca²⁺, use the Amber ion templates bundled
+  with the TIP3P force field. Missing formal charges use the template charge;
+  conflicting explicit charges are rejected. This does not model bonded metal coordination.
 - Disconnected drug-like ligands use OpenFF Sage 2.2.1 with AM1-BCC charges.
-  Parameters are cached, so the first run can take about a minute and repeats are
-  much faster.
+  Parameters are cached, so the first run can take several minutes for a large
+  ligand and repeats are much faster.
 - Recognized covalent glycans use GLYCAM06j with ff14SB, compiled automatically
   by AmberTools and minimized by OpenMM.
 - AIB is supported using the Amber ff15ipq-m template plus the packaged bridge
@@ -124,8 +127,9 @@ The plugin chooses a backend from the structure:
   planarity terms. A post-relaxation check rejects non-planar peptide bonds or a
   still-collapsed `CB1-CA-CB2` angle instead of returning bad coordinates.
 
-For ambiguous PDB/mmCIF ligands, the plugin attempts bond-order and common net
-charge inference. SDF or MOL2 with explicit bond orders and formal charges is
+For ambiguous PDB/mmCIF ligands, the plugin resolves recognizable carboxylate
+and guanidinium resonance groups, then attempts bounded bond-order and net
+charge inference (up to ±6 when the input omits charges). SDF or MOL2 with explicit bond orders and formal charges is
 still preferred. Inferred parameters are suitable for clash cleanup, not a claim
 of thermodynamic accuracy.
 
@@ -136,7 +140,14 @@ inventing a topology. Thorough mode's OBC2/GLYCAM combination is a pragmatic
 geometry solvent model and may emit a non-optimal GB-radius warning.
 
 Protein heavy atoms and termini are repaired in the OpenMM working model with
-PDBFixer; missing residues are never invented. Protein hydrogens are temporary.
+PDBFixer; missing residues are never invented. Protein hydrogens are temporary. Original ligand bonds are preserved through
+heavy-atom/terminal repair, including `UNK` ligands whose bonds PDBFixer can
+otherwise discard when inserting a missing protein terminus.
+Interleaved protein/water residues are grouped in the working topology and mapped
+back to the original PyMOL atom order. Repeated ligand atom names receive temporary
+unique names. Extra inter-residue bonds to a hydrogen already bonded within its
+residue are removed before hydrogen addition; this prevents close contacts from
+being mistaken for covalent ligand attachments.
 Ligand hydrogens are added to the PyMOL object. Linked PDB glycans that retain an
 anomeric O1 despite an inter-residue C1 bond are rejected with a residue-specific
 error. The plugin never silently deletes these chemically impossible atoms.
@@ -149,6 +160,15 @@ Both supplied development structures run through the public plugin commands:
   atoms produce a clear error, and the PyMOL object remains unchanged.
 - `san_glycan.pdb`: the cleaned protein, three N-glycans, and AIB; 5,533 prepared
   atoms. Quick Relax completes in roughly 4.7 seconds on the development Mac.
+- `test_me.pdb`: interleaved protein/water numbering plus an unnamed ligand;
+  both modes complete with 5,901 prepared atoms after removing a false
+  ligand–protein hydrogen bond.
+- `test_with_CA_ion.pdb`: protein, a large ligand with carboxylate/guanidinium
+  resonance groups, and Ca²⁺; both modes complete with 3,750 prepared atoms.
+  The ligand is inferred as −4 and calcium uses the Amber +2 template.
+- `fail_check.pdb`: two protein chains missing terminal OXT atoms plus a
+  phosphorus-containing `UNK` ligand. Repair adds both termini while retaining
+  all 88 ligand bonds; both modes complete with 4,414 prepared atoms.
 - `PET_test.cif`: protein plus a ligand; 7,807 prepared atoms and 464 movable
   pocket atoms. Cached Quick Relax takes roughly 6 seconds; Thorough Relax
   roughly 70 seconds.
