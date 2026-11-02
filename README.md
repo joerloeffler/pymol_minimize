@@ -6,7 +6,7 @@ glycan, side chains, or whole model is allowed to relax freely.
 
 - **Quick Relax** is the everyday button: 100 L-BFGS iterations in a fast
   nonperiodic field.
-- **Thorough Relax** uses staged restraints, 1,000 final iterations, and OBC2
+- **Thorough Relax** uses staged restraints, 1,000 total iterations, and OBC2
   implicit solvent. Use it for difficult clashes or after model building.
 
 This is a geometry-repair tool, not an energy-scoring workflow. It preserves the
@@ -88,6 +88,12 @@ Open **Plugin → Quick Minimize**, enter the movable selection and complete
 system, and click either button. `Auto` iterations means 100 for Quick and the
 full staged protocol for Thorough.
 
+Iteration limits cover all stages combined. Original atoms outside the exact
+movable selection retain the outside restraint, even when another atom in the
+same residue is selected. Newly prepared atoms inherit mobility from their residue.
+Preparation failures restore the PyMOL session rather than leaving added atoms
+or edited bonds behind.
+
 If the menu entry is hidden by a PyMOL/plugin-manager issue, enter
 `quick_minimize_gui` to open the same two-button window. The compatibility command
 `quick_minimize` is an alias for `quick_relax`. With no active `sele`, either
@@ -112,7 +118,7 @@ ordinary workstations.
 
 The plugin chooses a backend from the structure:
 
-- Standard proteins/nucleic acids use Amber ff14SB in OpenMM.
+- Standard proteins use Amber ff14SB; DNA uses OL15 and RNA uses OL3 in OpenMM.
 - Isolated common ions, including Ca²⁺, use the Amber ion templates bundled
   with the TIP3P force field. Missing formal charges use the template charge;
   conflicting explicit charges are rejected. This does not model bonded metal coordination.
@@ -138,6 +144,13 @@ radicals, arbitrary modified residues, and mixed glycan systems containing an
 additional unsupported ligand. These fail with an error instead of silently
 inventing a topology. Thorough mode's OBC2/GLYCAM combination is a pragmatic
 geometry solvent model and may emit a non-optimal GB-radius warning.
+
+The Amber/GLYCAM backend honors explicit tolerance and implicit-solvent options.
+It requires hydrogen rebuilding, so disabling hydrogen addition is rejected.
+Explicit input hydrogens must match template names and bonded parents; their
+input positions are restored before relaxation. Ambiguous atom mappings are
+rejected. OpenFF-only options such as `forcefield` and `cache` are rejected for
+this backend rather than silently ignored.
 
 Protein heavy atoms and termini are repaired in the OpenMM working model with
 PDBFixer; missing residues are never invented. Protein hydrogens are temporary. Original ligand bonds are preserved through
@@ -184,6 +197,21 @@ were marginal (worst approximately 0.64 Å), not catastrophic contacts.
 python -m compileall -q pymol_quick_minimize
 python -m unittest discover -s tests -v
 ```
+
+## Headless PDB relaxation
+
+Inside the environment, run `python minimize_pdb.py --pdb model.pdb`.
+Add `--selection 'organic'` to select a ligand, `--thorough` for staged
+relaxation, or `--iterations 100` to set the total iteration budget.
+The complete input remains in the force-field calculation. Existing output
+files are never overwritten.
+
+This runner requires complete explicit ligand/glycan hydrogens and preserves
+their names and connectivity. The Amber/GLYCAM path rejects hydrogens that do
+not match its templates, or templates that would introduce additional ligand
+hydrogens. PDB bond-order/charge inference still cannot establish the intended
+chemistry uniquely; supply a chemically complete input in the desired
+protonation state.
 
 ## Headless AIB batch relaxation
 

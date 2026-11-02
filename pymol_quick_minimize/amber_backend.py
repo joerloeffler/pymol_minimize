@@ -14,7 +14,8 @@ import tempfile
 
 import numpy as np
 
-from .core import MinimizationError, MinimizationResult, _as_bool
+from .core import (MinimizationError, MinimizationResult, _as_bool,
+                   _iteration_stages, _restore_on_failure)
 
 
 _PDB_SUGARS = {
@@ -203,7 +204,7 @@ def _compile_topology(cmd, system: str, state: int, work: Path):
 
 
 def _coordinate_mapping(model, topology, positions):
-    """Map PyMOL atoms to prepared particles by unchanged element/coordinates."""
+    """Map heavy atoms unambiguously, then hydrogens by residue/name/bond."""
     from openmm import unit
     from scipy.spatial import cKDTree
 
@@ -217,28 +218,51 @@ def _coordinate_mapping(model, topology, positions):
         for element, indices in by_element.items()
     }
     used = set()
-    mapping = []
-    for atom in model.atom:
+    mapping = [None] * len(model.atom)
+    for original_index, atom in enumerate(model.atom):
         element = (atom.symbol or atom.elem).upper()
+        if element == "H":
+            continue
         if element not in trees:
             raise MinimizationError(f"Prepared topology lost element {element}.")
         indices, tree = trees[element]
-        distances, local_indices = tree.query(np.asarray(atom.coord), k=min(8, len(indices)))
-        distances = np.atleast_1d(distances)
-        local_indices = np.atleast_1d(local_indices)
-        chosen = None
-        for distance, local_index in zip(distances, local_indices):
-            candidate = indices[int(local_index)]
-            if candidate not in used and float(distance) < 0.05:
-                chosen = candidate
-                break
-        if chosen is None:
+        candidates = [indices[i] for i in tree.query_ball_point(atom.coord, r=0.05)]
+        # Never break a coordinate tie by traversal order. Names can safely
+        # distinguish nearly coincident methyl carbons in collapsed inputs.
+        if len(candidates) > 1:
+            candidates = [i for i in candidates if atoms[i].name == atom.name]
+        if len(candidates) != 1 or candidates[0] in used:
             raise MinimizationError(
                 f"Could not safely map atom {atom.name} {atom.resn}{atom.resi} "
                 "into the prepared topology."
             )
-        used.add(chosen)
-        mapping.append(chosen)
+        mapping[original_index] = candidates[0]
+        used.add(candidates[0])
+
+    neighbors = {i: set() for i in range(len(atoms))}
+    for left, right in topology.bonds():
+        neighbors[left.index].add(right.index)
+        neighbors[right.index].add(left.index)
+    for original_index, atom in enumerate(model.atom):
+        if (atom.symbol or atom.elem).upper() != "H":
+            continue
+        original_neighbors = [
+            b.index[1] if b.index[0] == original_index else b.index[0]
+            for b in model.bond if original_index in b.index
+        ]
+        if len(original_neighbors) != 1 or mapping[original_neighbors[0]] is None:
+            raise MinimizationError("Explicit hydrogen has invalid or ambiguous connectivity.")
+        parent = mapping[original_neighbors[0]]
+        candidates = [i for i in neighbors[parent]
+                      if atoms[i].element.symbol == "H" and atoms[i].name == atom.name
+                      and atoms[i].residue == atoms[parent].residue]
+        if len(candidates) != 1 or candidates[0] in used:
+            raise MinimizationError(
+                f"Cannot preserve explicit hydrogen {atom.name} {atom.resn}{atom.resi}; "
+                "its name or protonation does not match the Amber template."
+            )
+        mapping[original_index] = candidates[0]
+        used.add(candidates[0])
     return mapping
 
 
@@ -377,9 +401,11 @@ def _validate_aib_geometry(topology, coordinates):
         )
 
 
+@_restore_on_failure
 def relax_compiled(
     selection="sele", system="all", state=1, mode="quick", quiet=0, _cmd=None,
     max_iterations=None, restraint=1000.0,
+    tolerance=None, implicit_solvent=None, add_hydrogens=True,
 ):
     from pymol import cmd as pymol_cmd
     from openmm import CustomExternalForce, LangevinMiddleIntegrator, Platform, unit
@@ -390,28 +416,75 @@ def relax_compiled(
     mode = str(mode).lower()
     if mode not in {"quick", "thorough"}:
         raise MinimizationError("mode must be quick or thorough")
+    if not _as_bool(add_hydrogens):
+        raise MinimizationError(
+            "Amber/GLYCAM preparation requires hydrogen rebuilding; "
+            "add_hydrogens=False is unsupported for AIB/glycan systems. "
+            "Matching explicit input hydrogens are restored before minimization."
+        )
+    tolerance = float(tolerance if tolerance is not None else (25 if mode == "quick" else 10))
+    restraint = float(restraint)
+    if not np.isfinite(tolerance) or tolerance <= 0:
+        raise MinimizationError("tolerance must be finite and positive.")
+    if not np.isfinite(restraint) or restraint < 0:
+        raise MinimizationError("restraint must be finite and nonnegative.")
+    implicit_solvent = mode == "thorough" if implicit_solvent is None else _as_bool(implicit_solvent)
+    stages = _iteration_stages(
+        max_iterations if max_iterations is not None else (100 if mode == "quick" else 1000),
+        mode == "thorough",
+    )
     selected_keys = {
         _selection_key(a) for a in cmd.get_model(f"({system}) and ({selection})", state).atom
     }
     if not selected_keys:
         raise MinimizationError("The movable selection contains no atoms.")
+    # Coordinate write-back must follow the original selection's atom order,
+    # which may differ from the merged temporary object's order.
+    cleaned_model = cmd.get_model(system, state)
 
     with tempfile.TemporaryDirectory(prefix="pymol-quick-relax-") as temp:
         work = Path(temp)
-        cleaned_model, surplus, _, _ = _compile_topology(cmd, system, state, work)
+        _, surplus, _, _ = _compile_topology(cmd, system, state, work)
         prmtop = AmberPrmtopFile(str(work / "system.prmtop"))
         inpcrd = AmberInpcrdFile(str(work / "system.inpcrd"))
         mapping = _coordinate_mapping(cleaned_model, prmtop.topology, inpcrd.positions)
+        if getattr(cmd, "preserve_ligand_hydrogens", False):
+            # The headless runner promises complete explicit nonpolymer H.
+            # Reject any template-added H in those residues rather than silently
+            # minimizing a different protonation state and omitting H on export.
+            nonpolymer_indices = {a.index for a in cmd.get_model(
+                f"({system}) and not polymer and not solvent", state
+            ).atom}
+            source_model = cmd.get_model(system, state)
+            prepared_atoms = list(prmtop.topology.atoms())
+            ligand_residues = {
+                prepared_atoms[mapping[i]].residue
+                for i, atom in enumerate(source_model.atom)
+                if atom.index in nonpolymer_indices
+            }
+            mapped = set(mapping)
+            if any(a.element.symbol == "H" and a.index not in mapped
+                   and a.residue in ligand_residues for a in prepared_atoms):
+                raise MinimizationError(
+                    "Ligand/glycan hydrogens are incomplete for the Amber template; "
+                    "supply complete explicit hydrogens in the desired protonation state."
+                )
+        # LEaP rebuilds H positions. Restore every original input coordinate,
+        # including mapped hydrogens, before evaluating the force field.
+        prepared_xyz = np.asarray(inpcrd.positions.value_in_unit(unit.angstrom), dtype=float).copy()
+        for original, particle in enumerate(mapping):
+            prepared_xyz[particle] = cleaned_model.atom[original].coord
+        prepared_positions = prepared_xyz * unit.angstrom
         selected_clean_positions = {
             i for i, atom in enumerate(cleaned_model.atom)
             if _selection_key(atom) in selected_keys
         }
         selected_particles = {mapping[i] for i in selected_clean_positions}
-        selected_residues = {
-            list(prmtop.topology.atoms())[i].residue for i in selected_particles
-        }
+        prepared_atoms = list(prmtop.topology.atoms())
+        selected_residues = {prepared_atoms[i].residue for i in selected_particles}
+        mapped_particles = set(mapping)
         for atom in prmtop.topology.atoms():
-            if atom.residue in selected_residues:
+            if atom.index not in mapped_particles and atom.residue in selected_residues:
                 selected_particles.add(atom.index)
 
         system_kwargs = {
@@ -419,11 +492,11 @@ def relax_compiled(
             "constraints": None,
             "removeCMMotion": False,
         }
-        if mode == "thorough":
+        if implicit_solvent:
             system_kwargs["implicitSolvent"] = OBC2
         omm_system = prmtop.createSystem(**system_kwargs)
         _add_aib_geometry_guards(omm_system, prmtop.topology)
-        reference = inpcrd.positions.value_in_unit(unit.nanometer)
+        reference = prepared_positions.value_in_unit(unit.nanometer)
         outside = CustomExternalForce("outside_k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
         outside.addGlobalParameter(
             "outside_k", float(restraint) * unit.kilojoule_per_mole / unit.nanometer**2
@@ -469,22 +542,25 @@ def relax_compiled(
         )
         platform = Platform.getPlatformByName("CPU")
         simulation = Simulation(prmtop.topology, omm_system, integrator, platform)
-        simulation.context.setPositions(inpcrd.positions)
+        simulation.context.setPositions(prepared_positions)
         initial = simulation.context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
             unit.kilojoule_per_mole
         )
-        iterations = int(max_iterations or (100 if mode == "quick" else 1000))
         if mode == "thorough":
-            simulation.minimizeEnergy(tolerance=50, maxIterations=300)
+            if stages[0]:
+                simulation.minimizeEnergy(tolerance=50, maxIterations=stages[0])
             simulation.context.setParameter("movable_k", 100.0)
-            simulation.minimizeEnergy(tolerance=20, maxIterations=500)
+            if stages[1]:
+                simulation.minimizeEnergy(tolerance=20, maxIterations=stages[1])
             simulation.context.setParameter("movable_k", 0.0)
-            simulation.minimizeEnergy(tolerance=10, maxIterations=iterations)
+            simulation.minimizeEnergy(tolerance=tolerance, maxIterations=stages[2])
         else:
-            simulation.minimizeEnergy(tolerance=25, maxIterations=iterations)
+            simulation.minimizeEnergy(tolerance=tolerance, maxIterations=stages[2])
         final_state = simulation.context.getState(getPositions=True, getEnergy=True)
         final = final_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         final_positions = final_state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+        if not np.isfinite(final_positions).all() or not np.isfinite(final):
+            raise MinimizationError("Minimization produced non-finite coordinates or energy.")
         _validate_aib_geometry(prmtop.topology, final_positions)
         output_coordinates = [final_positions[i] for i in mapping]
 
@@ -508,6 +584,6 @@ def relax_compiled(
         print(
             f"{mode.title()} Relax: {result.movable_atom_count}/{result.atom_count} atoms movable; "
             "complete Amber/GLYCAM topology, "
-            + ("OBC2 implicit solvent" if mode == "thorough" else "fast nonperiodic field")
+            + ("OBC2 implicit solvent" if implicit_solvent else "fast nonperiodic field")
         )
     return result

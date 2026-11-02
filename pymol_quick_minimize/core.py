@@ -7,6 +7,9 @@ from pathlib import Path
 from io import StringIO
 from copy import copy
 import os
+import math
+from functools import wraps
+from inspect import signature
 from typing import Any
 
 
@@ -133,9 +136,11 @@ def _build_topology(model: Any):
                 f"Atom {atom.name!r} in {atom.resn}{atom.resi} has unsupported element {symbol!r}."
             ) from exc
         # Numeric, globally unique ids survive OpenMM Modeller's topology copy.
-        omm_atoms[position] = topology.addAtom(
-            atom_names.get(position, atom.name or symbol), element, residue, id=str(position + 1)
-        )
+        name = atom_names.get(position, atom.name or symbol)
+        if atom.resn.upper() in {"A", "C", "G", "U", "DA", "DC", "DG", "DT"}:
+            name = {"O1P": "OP1", "O2P": "OP2", "O3P": "OP3"}.get(name, name)
+            name = name.replace("*", "'")
+        omm_atoms[position] = topology.addAtom(name, element, residue, id=str(position + 1))
 
     bond_types = {1: None, 2: "Double", 3: "Triple", 4: "Aromatic"}
     from openmm.app import Double, Triple, Aromatic
@@ -422,6 +427,34 @@ def _topology_atom_key(atom) -> tuple[int, int, str]:
     return atom.residue.chain.index, atom.residue.index, atom.name
 
 
+def _iteration_stages(limit, thorough):
+    """Share a total iteration budget across the staged protocol."""
+    limit = int(limit)
+    if limit < 1:
+        raise MinimizationError("max_iterations must be positive.")
+    if not thorough:
+        return (0, 0, limit)
+    first = min(300, limit // 6)
+    second = min(500, limit * 5 // 18)
+    return first, second, limit - first - second
+
+
+def _restore_on_failure(function):
+    parameters = signature(function)
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        from pymol import cmd as pymol_cmd
+        cmd = parameters.bind_partial(*args, **kwargs).arguments.get("_cmd") or pymol_cmd
+        snapshot = cmd.get_session()
+        try:
+            return function(*args, **kwargs)
+        except Exception:
+            cmd.set_session(snapshot)
+            raise
+    return wrapped
+
+
+@_restore_on_failure
 def minimize_selection(
     selection: str = "sele",
     system: str = "all",
@@ -453,6 +486,11 @@ def minimize_selection(
     max_iterations = int(max_iterations)
     tolerance = float(tolerance)
     restraint = float(restraint)
+    _iteration_stages(max_iterations, False)
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise MinimizationError("tolerance must be finite and positive.")
+    if not math.isfinite(restraint) or restraint < 0:
+        raise MinimizationError("restraint must be finite and nonnegative.")
     quiet = _as_bool(quiet)
     implicit_solvent = _as_bool(implicit_solvent)
     relax_mode = str(relax_mode).strip().lower()
@@ -480,7 +518,8 @@ def minimize_selection(
         # those explicit H atoms are required to preserve the ligand's identity.
         # Protein H atoms are added below by OpenMM, whose residue templates know
         # the correct terminal/protonation naming and bonding patterns.
-        cmd.h_add(f"({system}) and not polymer", state=state)
+        standard_names = "+".join(sorted(_BIOPOLYMER_RESIDUES))
+        cmd.h_add(f"({system}) and not polymer and not resn {standard_names}", state=state)
 
     model = _without_spurious_hydrogen_bonds(cmd.get_model(system, state))
     if not model.atom:
@@ -518,7 +557,8 @@ def minimize_selection(
         raise MinimizationError("Automatic heavy-atom/terminal repair failed: " + str(exc)) from exc
 
     cache_path = _template_cache_path(cache)
-    forcefield_files = ["amber/protein.ff14SB.xml", "amber/tip3p_standard.xml"]
+    forcefield_files = ["amber/protein.ff14SB.xml", "amber/DNA.OL15.xml",
+                        "amber/RNA.OL3.xml", "amber/tip3p_standard.xml"]
     if implicit_solvent:
         forcefield_files.append("implicit/obc2.xml")
     generator = SystemGenerator(
@@ -551,10 +591,12 @@ def minimize_selection(
             "OpenMM structure preparation changed original atom identities; refusing unsafe "
             "coordinate write-back."
         )
+    original_key_set = set(original_atom_keys)
     movable_positions = {
         i for i, atom in enumerate(topology.atoms())
         if _topology_atom_key(atom) in movable_original_keys
-        or _topology_atom_key(atom)[:2] in movable_residue_keys
+        or (_topology_atom_key(atom) not in original_key_set
+            and _topology_atom_key(atom)[:2] in movable_residue_keys)
     }
     try:
         omm_system = generator.create_system(topology, molecules=molecules)
@@ -617,17 +659,23 @@ def minimize_selection(
     simulation = Simulation(topology, omm_system, integrator, platform)
     simulation.context.setPositions(positions)
     initial_energy = _energy(simulation.context)
+    stages = _iteration_stages(max_iterations, relax_mode == "thorough")
     if relax_mode == "thorough":
-        simulation.minimizeEnergy(tolerance=50, maxIterations=min(300, max_iterations))
+        if stages[0]:
+            simulation.minimizeEnergy(tolerance=50, maxIterations=stages[0])
         simulation.context.setParameter("movable_k", 100.0)
-        simulation.minimizeEnergy(tolerance=20, maxIterations=min(500, max_iterations))
+        if stages[1]:
+            simulation.minimizeEnergy(tolerance=20, maxIterations=stages[1])
         simulation.context.setParameter("movable_k", 0.0)
-        simulation.minimizeEnergy(tolerance=tolerance, maxIterations=max_iterations)
+        simulation.minimizeEnergy(tolerance=tolerance, maxIterations=stages[2])
     else:
         simulation.minimizeEnergy(tolerance=tolerance, maxIterations=max_iterations)
     final_energy = _energy(simulation.context)
     minimized = simulation.context.getState(getPositions=True).getPositions(asNumpy=True)
     coordinates = minimized.value_in_unit(unit.angstrom)
+    import numpy as np
+    if not np.isfinite(coordinates).all() or not math.isfinite(final_energy):
+        raise MinimizationError("Minimization produced non-finite coordinates or energy.")
     original_coordinates = [
         coordinates[position_by_key[key]] for key in original_atom_keys
     ]
@@ -666,10 +714,14 @@ def quick_relax(selection="sele", system="all", quiet=0, _cmd=None, **kwargs):
     if str(selection).strip() == "sele" and "sele" not in active_cmd.get_names("selections"):
         selection = system
     if requires_compiled_backend(active_cmd, system, int(kwargs.get("state", 1))):
+        _check_compiled_options(kwargs)
         return relax_compiled(
             selection, system, mode="quick", quiet=quiet, _cmd=active_cmd,
             state=kwargs.get("state", 1), max_iterations=kwargs.get("max_iterations"),
             restraint=kwargs.get("restraint", 1000.0),
+            tolerance=kwargs.get("tolerance", 25.0),
+            implicit_solvent=kwargs.get("implicit_solvent", False),
+            add_hydrogens=kwargs.get("add_hydrogens", True),
         )
     kwargs.setdefault("max_iterations", 100)
     kwargs.setdefault("tolerance", 25.0)
@@ -689,10 +741,14 @@ def thorough_relax(selection="sele", system="all", quiet=0, _cmd=None, **kwargs)
     if str(selection).strip() == "sele" and "sele" not in active_cmd.get_names("selections"):
         selection = system
     if requires_compiled_backend(active_cmd, system, int(kwargs.get("state", 1))):
+        _check_compiled_options(kwargs)
         return relax_compiled(
             selection, system, mode="thorough", quiet=quiet, _cmd=active_cmd,
             state=kwargs.get("state", 1), max_iterations=kwargs.get("max_iterations"),
             restraint=kwargs.get("restraint", 1000.0),
+            tolerance=kwargs.get("tolerance", 10.0),
+            implicit_solvent=kwargs.get("implicit_solvent", True),
+            add_hydrogens=kwargs.get("add_hydrogens", True),
         )
     kwargs.setdefault("max_iterations", 1000)
     kwargs.setdefault("tolerance", 10.0)
@@ -700,3 +756,14 @@ def thorough_relax(selection="sele", system="all", quiet=0, _cmd=None, **kwargs)
     kwargs.setdefault("implicit_solvent", 1)
     kwargs["relax_mode"] = "thorough"
     return minimize_selection(selection, system, quiet=quiet, _cmd=active_cmd, **kwargs)
+
+
+def _check_compiled_options(options):
+    supported = {"state", "max_iterations", "restraint", "tolerance",
+                 "implicit_solvent", "add_hydrogens"}
+    unsupported = set(options) - supported
+    if unsupported:
+        raise MinimizationError(
+            "Unsupported options for the Amber/GLYCAM backend: "
+            + ", ".join(sorted(unsupported))
+        )

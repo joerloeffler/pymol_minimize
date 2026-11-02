@@ -15,6 +15,136 @@ class QuickMinimizeSmokeTests(unittest.TestCase):
     def setUp(self):
         cmd.reinitialize()
 
+    def test_single_atom_selection_does_not_free_entire_ligand(self):
+        cmd.fragment("methane", "lig")
+        result = quick_relax("lig and elem C", "lig", max_iterations=1,
+                             quiet=1, cache="", _cmd=cmd)
+        self.assertEqual(result.movable_atom_count, 1)
+
+    def test_dna_and_rna_round_trip(self):
+        for mode in ("DNA", "RNA"):
+            with self.subTest(mode=mode):
+                cmd.reinitialize()
+                cmd.fnab("AC", name="mol", mode=mode, dbl_helix=0)
+                # PyMOL's builder leaves an incomplete terminal phosphate.
+                # Use a conventional 5'-OH terminus for the force-field test.
+                cmd.remove("hydro or (resi 1 and name P+O1P+O2P)")
+                before = cmd.get_model("mol")
+                result = quick_relax("all", "mol", max_iterations=1,
+                                     cache="", quiet=1, _cmd=cmd)
+                after = cmd.get_model("mol")
+                self.assertEqual([a.name for a in before.atom], [a.name for a in after.atom])
+                self.assertEqual(len(before.atom), len(after.atom))
+                self.assertTrue(np.isfinite(cmd.get_coords("mol")).all())
+                self.assertLess(result.final_energy_kj_mol, result.initial_energy_kj_mol)
+
+    def test_headless_script_preserves_explicit_ligand_hydrogens(self):
+        import os
+        from unittest.mock import patch
+        import minimize_pdb
+        cmd.fragment("methane", "mol")
+        before = minimize_pdb.ligand_signature(cmd)
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "input.pdb"
+            cmd.save(str(source), "mol")
+            for mode in ("quick", "thorough"):
+                output = Path(temp) / f"{mode}.pdb"
+                argv = ["minimize_pdb.py", "--pdb", str(source), "--output",
+                        str(output), "--iterations", "1"]
+                if mode == "thorough":
+                    argv.append("--thorough")
+                with patch("sys.argv", argv), patch.dict(os.environ, {"XDG_CACHE_HOME": temp}):
+                    self.assertEqual(minimize_pdb.main(), 0)
+                cmd.reinitialize()
+                cmd.load(str(output), "mol")
+                self.assertEqual(minimize_pdb.ligand_signature(cmd), before)
+
+    def test_failed_preparation_restores_atoms_bonds_and_coordinates(self):
+        from unittest.mock import patch
+        cmd.fragment("methane", "lig")
+        cmd.remove("hydro")
+        before = cmd.get_model("lig")
+        with patch("pymol_quick_minimize.core._small_molecules_from_model",
+                   side_effect=RuntimeError("forced preparation failure")):
+            with self.assertRaisesRegex(RuntimeError, "forced preparation failure"):
+                quick_relax("lig", "lig", quiet=1, cache="", _cmd=cmd)
+        after = cmd.get_model("lig")
+        self.assertEqual([(a.name, a.symbol) for a in before.atom],
+                         [(a.name, a.symbol) for a in after.atom])
+        self.assertEqual(len(before.bond), len(after.bond))
+        np.testing.assert_array_equal([a.coord for a in before.atom],
+                                      [a.coord for a in after.atom])
+
+    def test_total_iteration_budget(self):
+        from pymol_quick_minimize.core import _iteration_stages
+        for limit in (1, 2, 3, 100, 1000, 1800, 5000):
+            stages = _iteration_stages(limit, True)
+            self.assertEqual(sum(stages), limit)
+            self.assertGreater(stages[-1], 0)
+        for invalid in (0, -1):
+            with self.assertRaises(RuntimeError):
+                _iteration_stages(invalid, True)
+
+    def test_compiled_mapping_preserves_hydrogen_identity(self):
+        from types import SimpleNamespace
+        from openmm import Vec3, unit
+        from openmm.app import Element, Topology
+        from pymol_quick_minimize.amber_backend import _coordinate_mapping
+        topology = Topology()
+        residue = topology.addResidue("AIB", topology.addChain())
+        carbon = topology.addAtom("CB1", Element.getBySymbol("C"), residue)
+        hydrogen = topology.addAtom("HB11", Element.getBySymbol("H"), residue)
+        topology.addBond(carbon, hydrogen)
+        model = SimpleNamespace(atom=[
+            SimpleNamespace(symbol="C", name="CB1", resn="AIB", resi="1", coord=[0, 0, 0]),
+            SimpleNamespace(symbol="H", name="HB11", resn="AIB", resi="1", coord=[0.1, 0, 0]),
+        ], bond=[SimpleNamespace(index=[0, 1])])
+        # Rebuilt hydrogen may be far from its original coordinate.
+        positions = [Vec3(0, 0, 0), Vec3(-1, 0, 0)] * unit.angstrom
+        self.assertEqual(_coordinate_mapping(model, topology, positions), [0, 1])
+        model.atom[1].name = "UNKNOWN"
+        with self.assertRaisesRegex(RuntimeError, "Cannot preserve explicit hydrogen"):
+            _coordinate_mapping(model, topology, positions)
+
+    def test_compiled_mapping_rejects_coordinate_ambiguity(self):
+        from types import SimpleNamespace
+        from openmm import Vec3, unit
+        from openmm.app import Element, Topology
+        from pymol_quick_minimize.amber_backend import _coordinate_mapping
+        topology = Topology()
+        chain = topology.addChain()
+        for number in (1, 2):
+            residue = topology.addResidue("ALA", chain, id=str(number))
+            topology.addAtom("CA", Element.getBySymbol("C"), residue)
+        model = SimpleNamespace(atom=[SimpleNamespace(
+            symbol="C", name="CA", resn="ALA", resi="1", coord=[0, 0, 0]
+        )], bond=[])
+        with self.assertRaisesRegex(RuntimeError, "Could not safely map"):
+            _coordinate_mapping(model, topology,
+                                [Vec3(0, 0, 0), Vec3(0.001, 0, 0)] * unit.angstrom)
+
+    def test_compiled_backend_does_not_ignore_options(self):
+        from pymol_quick_minimize.core import _check_compiled_options
+        from pymol_quick_minimize.amber_backend import relax_compiled
+        with self.assertRaisesRegex(RuntimeError, "Unsupported options"):
+            _check_compiled_options({"forcefield": "openff-2.2.1"})
+        with self.assertRaisesRegex(RuntimeError, "requires hydrogen rebuilding"):
+            relax_compiled(add_hydrogens=False, _cmd=cmd)
+
+    def test_compiled_glycoprotein_round_trip(self):
+        fixture = Path(__file__).resolve().parents[1] / "dev/san_glycan.pdb"
+        if not fixture.exists():
+            self.skipTest("Development glycoprotein is not included")
+        cmd.load(str(fixture), "mol")
+        before = cmd.get_model("mol")
+        result = quick_relax("resn AIB", "mol", quiet=1, _cmd=cmd)
+        after = cmd.get_model("mol")
+        self.assertEqual([(a.index, a.name) for a in before.atom],
+                         [(a.index, a.name) for a in after.atom])
+        self.assertEqual(result.movable_atom_count, 13)
+        self.assertTrue(np.isfinite(cmd.get_coords("mol")).all())
+        self.assertLess(result.final_energy_kj_mol, result.initial_energy_kj_mol)
+
     def test_dependencies_are_complete(self):
         self.assertTrue(check_installation(quiet=1).ok)
 

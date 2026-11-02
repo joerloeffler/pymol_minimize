@@ -1,4 +1,4 @@
-#!/Users/joe/miniforge3/envs/pymol-quick-minimize/bin/python
+#!/usr/bin/env python
 """Headless PDB relaxation using the pymol-quick-minimize environment.
 
 Examples:
@@ -25,6 +25,7 @@ class PreserveLigandHydrogens:
 
     def __init__(self, cmd):
         self.cmd = cmd
+        self.preserve_ligand_hydrogens = True
 
     def __getattr__(self, name):
         return getattr(self.cmd, name)
@@ -51,7 +52,7 @@ def main() -> int:
     parser.add_argument('-o', '--output', type=Path, help='Output PDB (single input only)')
     parser.add_argument('--selection', default='all', help='Movable PyMOL selection (default: all)')
     parser.add_argument('--thorough', action='store_true', help='Use staged implicit-solvent relaxation')
-    parser.add_argument('--iterations', type=int, help='Iteration limit (default: 100 quick / 1000 thorough)')
+    parser.add_argument('--iterations', type=int, help='Total iteration limit across all stages (default: 100 quick / 1000 thorough)')
     args = parser.parse_args()
     if args.output and len(args.pdb) != 1:
         parser.error('--output requires exactly one --pdb input')

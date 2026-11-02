@@ -39,7 +39,7 @@ def show_dialog():
 
     layout.addRow("Movable selection", movable)
     layout.addRow("Complete system", system)
-    layout.addRow("Maximum iterations", iterations)
+    layout.addRow("Total maximum iterations", iterations)
     layout.addRow("Outside restraint (kJ/mol/nm²)", restraint)
     layout.addRow(hydrogens)
     layout.addRow(status)
